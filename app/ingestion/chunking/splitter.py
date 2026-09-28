@@ -5,28 +5,33 @@ import logfire
 
 def chunk_text(text: str, chunk_size: int = 1500) -> List[str]:
     """
-    Simple semantic-ish chunker that splits by paragraphs.
-    Ensures chunks do not exceed the specified size.
+    Split raw document text into chunks that fit within chunk_size characters.
+
+    The splitter treats double newlines as paragraph boundaries, accumulating
+    paragraphs into a growing chunk until the next paragraph would exceed the
+    size limit, at which point the current chunk is flushed and a new one begins.
+    This approach keeps semantically related sentences together rather than
+    cutting mid-paragraph.
     """
-    with logfire.span("✂️ Text Chunking", text_length=len(text)):
+    with logfire.span("Chunk text", text_length=len(text)):
         if not text.strip():
             return []
 
         paragraphs = text.split("\n\n")
-        chunks = []
-        current_chunk = ""
+        chunks: List[str] = []
+        current = ""
 
-        for p in paragraphs:
-            if len(current_chunk) + len(p) < chunk_size:
-                current_chunk += p + "\n\n"
+        for paragraph in paragraphs:
+            if len(current) + len(paragraph) < chunk_size:
+                current += paragraph + "\n\n"
             else:
-                if current_chunk.strip():
-                    chunks.append(current_chunk.strip())
-                current_chunk = p + "\n\n"
+                if current.strip():
+                    chunks.append(current.strip())
+                current = paragraph + "\n\n"
 
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
+        if current.strip():
+            chunks.append(current.strip())
 
-        valid_chunks = [c for c in chunks if c.strip()]
-        logfire.info(f"✅ Generated {len(valid_chunks)} chunks")
-        return valid_chunks
+        valid = [c for c in chunks if c.strip()]
+        logfire.info(f"Generated {len(valid)} chunks from {len(text)} characters.")
+        return valid

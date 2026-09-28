@@ -9,15 +9,23 @@ from app.config import settings
 _JINA_RERANK_URL = "https://api.jina.ai/v1/rerank"
 _JINA_RERANK_MODEL = "jina-reranker-v3"
 
+# Lazy singleton — created on first call to rerank_documents.
 _ranker = None
 
 
 class _JinaReranker:
-    """Thin wrapper around the Jina Reranker API."""
+    """Wraps the Jina Reranker API for cross-encoder reranking of candidate documents."""
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[str]:
-        """Score and reorder documents against the query via the Jina API."""
-        response = requests.post(
+        """
+        Score and reorder documents by their relevance to the query.
+
+        Sends all candidate documents to the Jina cross-encoder in a single
+        POST request. The API returns results sorted by relevance_score descending.
+        If a result item is missing its document text, we fall back to looking
+        up the original text by index.
+        """
+        resp = requests.post(
             _JINA_RERANK_URL,
             headers={
                 "Authorization": f"Bearer {settings.JINA_API_KEY}",
@@ -32,30 +40,25 @@ class _JinaReranker:
             },
             timeout=60,
         )
-        response.raise_for_status()
-        payload = response.json()
+        resp.raise_for_status()
 
-        results = payload.get("results", [])
-        # Results are already sorted by relevance_score descending
-        reranked_docs = []
-        for res in results[:top_n]:
-            doc_text = res.get("document")
-            if doc_text is None:
-                # Fallback to original index if document text is missing
-                index = res.get("index")
-                if index is not None and 0 <= index < len(documents):
-                    doc_text = documents[index]
-            if doc_text is not None:
-                reranked_docs.append(doc_text)
-
-        return reranked_docs
+        reranked = []
+        for item in resp.json().get("results", [])[:top_n]:
+            text = item.get("document")
+            if text is None:
+                idx = item.get("index")
+                if idx is not None and 0 <= idx < len(documents):
+                    text = documents[idx]
+            if text is not None:
+                reranked.append(text)
+        return reranked
 
 
 def _get_ranker() -> _JinaReranker:
-    """Returns the Jina Reranker wrapper (lazy singleton)."""
+    """Return the shared reranker instance, creating it on first call."""
     global _ranker
     if _ranker is None:
-        logfire.info("🧠 Initializing Jina Reranker v3 via API...")
+        logfire.info("Initializing Jina Reranker v3 client.")
         _ranker = _JinaReranker()
     return _ranker
 
@@ -66,34 +69,31 @@ def _get_ranker() -> _JinaReranker:
     reraise=True,
     before_sleep=before_sleep_log(logfire, "warning"),
 )
-def _rerank(query: str, documents: list[str], top_n: int) -> list[str]:
-    """Core Jina API reranking with retry on transient failures."""
-    ranker = _get_ranker()
-    return ranker.rerank(query, documents, top_n)
+def _rerank_with_retry(query: str, documents: list[str], top_n: int) -> list[str]:
+    """Call the Jina Reranker with automatic retry on transient HTTP failures."""
+    return _get_ranker().rerank(query, documents, top_n)
 
 
 def rerank_documents(query: str, documents: list[str], top_n: int = 5) -> list[str]:
     """
-    Refines retrieval results by re-scoring documents against the query semantically.
-    Retries transient failures and falls back to the original Qdrant order if
-    reranking ultimately fails, ensuring the user still receives an answer.
+    Re-score and filter the candidate document list using the Jina cross-encoder.
+
+    If JINA_API_KEY is absent or reranking fails after all retries, the original
+    Qdrant result order is preserved and the first top_n items are returned.
+    This ensures the Responder always receives some context even in a degraded state.
     """
     if not documents:
         return []
-
     if not settings.JINA_API_KEY:
-        logfire.warning("⚠️ JINA_API_KEY not set — skipping reranking.")
+        logfire.warning("JINA_API_KEY not set — skipping reranking, using raw Qdrant order.")
         return documents[:top_n]
 
-    start_time = time.time()
-    logfire.info(f"📡 [Reranker] Sending {len(documents)} docs to Jina Reranker API...")
-
+    t0 = time.time()
+    logfire.info(f"Sending {len(documents)} candidates to Jina Reranker.")
     try:
-        reranked_docs = _rerank(query, documents, top_n)
-        duration = time.time() - start_time
-        logfire.info(f"✅ [Reranker] Done in {duration:.2f}s.")
-        return reranked_docs
-    except Exception as e:
-        logfire.error(f"❌ [Reranker] Semantic Reranking Failed after retries: {e}")
-        # Fallback to the original Qdrant order to ensure the user still gets an answer
+        result = _rerank_with_retry(query, documents, top_n)
+        logfire.info(f"Reranking completed in {time.time() - t0:.2f}s.")
+        return result
+    except Exception as exc:
+        logfire.error(f"Reranking failed after retries ({exc}). Falling back to Qdrant order.")
         return documents[:top_n]

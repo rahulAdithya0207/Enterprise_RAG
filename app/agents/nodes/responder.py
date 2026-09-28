@@ -8,9 +8,21 @@ from app.gateway import extract_cache_status, portkey_client
 
 def generate_node(state: AgentState):
     """
-    Synthesizes a response using both Documentation Context AND Conversation History.
-    Uses the native Portkey client (not LangChain) so we can read the
-    x-portkey-cache-status response header and surface Cache: Hit in the UI.
+    Synthesize the final answer using retrieved context and conversation history.
+
+    Two prompt modes are used:
+    - CONVERSATIONAL: builds a prompt from chat history only (no document context).
+    - TECHNICAL: injects the top reranked document chunks before the question.
+
+    The LLM call goes through portkey_client (the raw OpenAI-SDK client pointed
+    at the Portkey gateway). Using the raw client instead of the LangChain wrapper
+    lets us inspect the response headers and detect whether Portkey served the
+    answer from its semantic cache, which gets surfaced in the plan log.
+
+    Retries on transient LLM failures are handled by _call_llm with exponential backoff.
+
+    State reads:  current_query, messages, documents, plan
+    State writes: final_answer, status, plan, messages
     """
     query = state["current_query"]
 
@@ -22,10 +34,10 @@ def generate_node(state: AgentState):
     user_msg = state["messages"][-1]["content"] if state["messages"] else ""
 
     if query == "CONVERSATIONAL":
-        logfire.info("Generating conversational response using memory.")
+        logfire.info("Generating conversational reply from memory.")
         prompt = f"""
-        You are a friendly and helpful Enterprise AI Assistant.
-        Answer the user's latest message using the CONVERSATION HISTORY below.
+        You are a helpful Enterprise IT Assistant.
+        Answer the user's latest message using the conversation history below.
 
         CONVERSATION HISTORY:
         {history_str}
@@ -34,23 +46,23 @@ def generate_node(state: AgentState):
         "{user_msg}"
         """
     else:
-        logfire.info("Generating technical RAG response.")
-        max_context_chars = 25000
-        full_context = ""
-
+        logfire.info("Generating technical answer from retrieved context.")
+        # Cap total context to avoid exceeding the LLM's token budget.
+        max_chars = 25000
+        context = ""
         for doc in state["documents"]:
-            if len(full_context) + len(doc) < max_context_chars:
-                full_context += doc + "\n\n"
+            if len(context) + len(doc) < max_chars:
+                context += doc + "\n\n"
             else:
-                logfire.warning("Context truncated to fit Groq TPM limits.")
+                logfire.warning("Context window cap reached — truncating document list.")
                 break
 
         prompt = f"""
-        You are a Senior Technical Architect.
-        Answer the question using the TECHNICAL CONTEXT provided.
+        You are a Senior Technical Architect specialising in Kubernetes, Intel hardware,
+        and enterprise networking. Answer the question using only the technical context below.
 
         TECHNICAL CONTEXT:
-        {full_context}
+        {context}
 
         CONVERSATION HISTORY:
         {history_str}
@@ -59,21 +71,20 @@ def generate_node(state: AgentState):
         "{user_msg}"
         """
 
-    with logfire.span("✍️ LLM Synthesis"):
+    with logfire.span("Responder — LLM synthesis"):
         try:
-            response = _generate_response(prompt)
+            response = _call_llm(prompt)
             content = response.choices[0].message.content
             cache_status = extract_cache_status(response)
-            is_cache_hit = cache_status == "HIT"
 
-            if is_cache_hit:
-                logfire.info("⚡ Gateway Cache Hit — response served from Portkey cache.")
-                plan_update = state["plan"] + ["Cache: Hit ⚡"]
-                status = "Cache hit — instant response."
+            if cache_status == "HIT":
+                logfire.info("Portkey cache hit — response served instantly.")
+                plan_update = state["plan"] + ["Cache: Hit"]
+                status = "Answered from cache."
             else:
-                logfire.info("✅ Response synthesised via LLM.")
+                logfire.info("LLM response generated.")
                 plan_update = state["plan"]
-                status = "Response generated."
+                status = "Answer generated."
 
             return {
                 "final_answer": content,
@@ -82,9 +93,9 @@ def generate_node(state: AgentState):
                 "messages": [{"role": "assistant", "content": content}],
             }
 
-        except Exception as e:
-            logfire.error(f"LLM Generation failed after retries: {e}")
-            raise e
+        except Exception as exc:
+            logfire.error(f"LLM call failed after all retries: {exc}")
+            raise
 
 
 @retry(
@@ -93,9 +104,16 @@ def generate_node(state: AgentState):
     reraise=True,
     before_sleep=before_sleep_log(logfire, "warning"),
 )
-def _generate_response(prompt: str):
-    """Call the LLM gateway with retry logic for transient failures."""
+def _call_llm(prompt: str):
+    """
+    Call the LLM through the Portkey gateway with retry on transient errors.
+
+    The model string uses Portkey's virtual-slug routing format:
+    @<slug>/<model-alias>. The slug maps to a provider config defined in the
+    Portkey dashboard — the underlying model (e.g. gpt-4o-mini or claude-haiku)
+    is set there, not in this codebase.
+    """
     return portkey_client.chat.completions.create(
-        model=f"@{settings.PORTKEY_PRIMARY_SLUG}/gpt-5-mini",
+        model=f"@{settings.PORTKEY_PRIMARY_SLUG}/{settings.PORTKEY_MODEL}",
         messages=[{"role": "user", "content": prompt}],
     )

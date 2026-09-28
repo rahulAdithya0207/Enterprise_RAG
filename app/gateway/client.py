@@ -1,24 +1,28 @@
 from langchain_openai import ChatOpenAI
-from openai import AsyncOpenAI, OpenAI
+from openai import OpenAI
 from portkey_ai import PORTKEY_GATEWAY_URL, createHeaders
 
 from app.config import settings
 
-# Portkey routing strategy:
-#   - Primary/fallback logic lives in a Portkey saved config (required when
-#     block_inline_config is enabled on the workspace).
-#   - We reference that config via the x-portkey-config-id header.
-#   - The inline config dict approach is disabled for this account, so all
-#     retry/fallback/cache behavior must be configured inside the Portkey UI.
+# Portkey acts as a reverse proxy in front of the actual LLM providers.
+# All routing rules (primary vs fallback, caching, retry policy) live inside
+# a "saved config" on the Portkey dashboard, referenced here by its ID.
+# This approach is required when block_inline_config is enabled on the workspace.
 
 
-def _make_headers(feature: str = "rag") -> dict:
-    """Build Portkey headers that reference the primary saved config by ID."""
+def _build_portkey_headers(feature: str = "rag") -> dict:
+    """
+    Assemble the Portkey request headers that activate the saved routing config.
+
+    The config_id tells Portkey which saved config to load for this request.
+    The metadata fields are forwarded to Portkey analytics and are visible
+    per-request in the Portkey dashboard for debugging.
+    """
     if not settings.PORTKEY_PRIMARY_CONFIG_ID:
         raise ValueError(
-            "PORTKEY_PRIMARY_CONFIG_ID is not set in .env. "
-            "Get the real pc-... ID from the Portkey dashboard or "
-            "run: PYTHONPATH=. python scripts/list_portkey_configs.py"
+            "PORTKEY_PRIMARY_CONFIG_ID is missing from .env. "
+            "Find the pc-... ID in the Portkey dashboard under Configs, "
+            "or run: PYTHONPATH=. python scripts/list_portkey_configs.py"
         )
     return createHeaders(
         api_key=settings.PORTKEY_API_KEY,
@@ -31,60 +35,47 @@ def _make_headers(feature: str = "rag") -> dict:
     )
 
 
-# OpenAI-compatible client routed through Portkey.
-# We use the OpenAI SDK directly because the native Portkey SDK does not
-# surface a first-class config_id constructor parameter; the header-based
-# approach works reliably with block_inline_config enabled.
+# Synchronous OpenAI-SDK client pointed at the Portkey gateway URL.
+# Portkey speaks the OpenAI API, so the SDK works without modification.
+# The model string uses Portkey's virtual-slug format (@slug/alias) — the
+# actual upstream model is configured on the Portkey dashboard, not here.
 portkey_client = OpenAI(
     api_key=settings.PORTKEY_API_KEY,
     base_url=PORTKEY_GATEWAY_URL,
-    default_headers=_make_headers(),
+    default_headers=_build_portkey_headers(),
 )
 
 
 def get_langchain_llm(feature: str = "rag") -> ChatOpenAI:
     """
-    Returns a Portkey-backed ChatOpenAI - a drop-in for LangChain nodes.
+    Return a LangChain-compatible LLM that routes through the Portkey gateway.
 
-    Why ChatOpenAI:
-      Portkey is a proxy. It exposes an OpenAI-compatible endpoint at PORTKEY_GATEWAY_URL.
-      ChatOpenAI supports base_url (points at Portkey) and default_headers (passes Portkey
-      auth + saved-config reference). The @slug/model-name format is Portkey-specific - the
-      upstream provider's own client does not understand it. Portkey is just in the middle.
+    ChatOpenAI accepts a custom base_url (pointed at Portkey) and default_headers
+    (carrying the Portkey auth and config reference). This makes it a drop-in
+    for any LangChain node without code changes to those nodes.
     """
     return ChatOpenAI(
         api_key=settings.PORTKEY_API_KEY,
         base_url=PORTKEY_GATEWAY_URL,
-        model=f"@{settings.PORTKEY_PRIMARY_SLUG}/gpt-5-mini",
-        default_headers=_make_headers(feature),
-    )
-
-
-def get_async_openai_client(feature: str = "rag") -> AsyncOpenAI:
-    """
-    Returns an async OpenAI client that routes through the Portkey gateway.
-    Use this for non-LangChain async LLM calls (e.g. async FastAPI endpoints).
-    """
-    return AsyncOpenAI(
-        api_key=settings.PORTKEY_API_KEY,
-        base_url=PORTKEY_GATEWAY_URL,
-        default_headers=_make_headers(feature),
+        model=f"@{settings.PORTKEY_PRIMARY_SLUG}/{settings.PORTKEY_MODEL}",
+        default_headers=_build_portkey_headers(feature),
     )
 
 
 def extract_cache_status(response) -> str:
     """
-    Pull x-portkey-cache-status from the response.
+    Try to read the x-portkey-cache-status header from an LLM response.
 
-    The OpenAI SDK does not expose raw headers on parsed responses, so cache
-    hit/miss tracking is best-effort. We inspect common attribute paths and
-    fall back to 'MISS'.
+    The OpenAI SDK wraps responses in a parsed object that doesn't directly
+    expose raw headers. We probe several common attribute paths where the SDK
+    might store the underlying HTTP response and fall back to 'MISS' if none
+    of them yield a header value.
     """
     for attr in ("_raw_response", "_response", "_http_response", "headers"):
         raw = getattr(response, attr, None)
         if raw is not None:
             headers = getattr(raw, "headers", None)
-            if headers is not None:
+            if headers:
                 status = headers.get("x-portkey-cache-status", "")
                 if status:
                     return status.upper()

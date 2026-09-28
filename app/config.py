@@ -1,4 +1,4 @@
-"""Centralized, Pydantic-validated application settings."""
+"""Pydantic-validated settings loaded from the .env file at startup."""
 
 import os
 from urllib.parse import quote, urlunsplit
@@ -8,11 +8,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Load and validate environment variables from `.env`.
+    """
+    Central configuration object for the entire application.
 
-    - `extra="ignore"` lets `.env` keep legacy keys (`POSTGRES_URI`, `REDIS_URL`,
-      old Groq keys, etc.) without failing startup.
-    - Required fields raise a clear validation error at import time if missing.
+    All values are pulled from environment variables or a .env file.
+    Unknown keys are silently ignored (extra="ignore") so legacy variable
+    names in existing .env files don't crash the app at import time.
+    Fields without a default are required — a missing key raises a clear
+    validation error before the server starts.
     """
 
     model_config = SettingsConfigDict(
@@ -21,41 +24,42 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- JINA AI (embeddings + reranker) ---
-    JINA_API_KEY: str
+    # Jina AI — used for both embeddings and reranking (optional, falls back to local models)
+    JINA_API_KEY: str | None = None
 
-    # --- OPENAI LLM ---
-    OPENAI_API_KEY: str
-    JUDGE_OPENAI_API_KEY: str | None = None
+    # OpenAI — primary LLM credentials (optional if using Portkey routing)
+    OPENAI_API_KEY: str | None = None
+    JUDGE_OPENAI_API_KEY: str | None = None  # separate key for the RAGAS judge LLM
 
-    # --- PORTKEY LLM GATEWAY ---
+    # Portkey LLM gateway — handles routing, fallback, caching, and retries
     PORTKEY_API_KEY: str
-    PORTKEY_PRIMARY_SLUG: str = "marathon-api"
+    PORTKEY_PRIMARY_SLUG: str = "google-gemini"
+    PORTKEY_MODEL: str = "gemini-2.5-flash"
     PORTKEY_FALLBACK_SLUG: str = "anthropic-fallback"
-    # Portkey saved config is referenced by its system-generated `pc-...` ID.
-    # Required when block_inline_config is enabled on the workspace.
+    # Portkey saved configs are referenced by their dashboard-assigned ID (pc-...).
+    # Required when the workspace has block_inline_config enabled.
     PORTKEY_PRIMARY_CONFIG_ID: str
 
-    # --- QDRANT VECTOR DB ---
-    QDRANT_URL: str = Field(validation_alias=AliasChoices("QDRANT_URL", "QDRANT_CLUSTER_ENDPOINT"))
+    # Qdrant vector database
+    QDRANT_URL: str | None = Field(default=None, validation_alias=AliasChoices("QDRANT_URL", "QDRANT_CLUSTER_ENDPOINT"))
     QDRANT_API_KEY: str | None = None
     QDRANT_COLLECTION: str = "enterprise_rag"
 
-    # --- NEON SERVERLESS POSTGRES (LangGraph checkpointer) ---
-    NEON_DB_URL: str
+    # Neon serverless Postgres — used as the LangGraph checkpoint store
+    NEON_DB_URL: str | None = None
 
-    # --- UPSTASH REDIS (rate limiting) ---
-    UPSTASH_REDIS_REST_URL: str
-    UPSTASH_REDIS_REST_TOKEN: str
+    # Upstash Redis — used for distributed rate limiting
+    UPSTASH_REDIS_REST_URL: str | None = None
+    UPSTASH_REDIS_REST_TOKEN: str | None = None
 
-    # --- API SAFETY ---
+    # API security
     API_KEY: str | None = Field(default=None, alias="RAG_API_KEY")
     RATE_LIMIT_PER_MINUTE: int = 20
-    STRICT_STARTUP: bool = False
+    STRICT_STARTUP: bool = False  # set True to abort startup if any dependency is down
 
-    # --- OBSERVABILITY ---
+    # Observability
     LOGFIRE_TOKEN: str | None = None
-    LOGFIRE_BASE_URL: str | None = None  # e.g. https://logfire-eu.pydantic.dev for EU tokens
+    LOGFIRE_BASE_URL: str | None = None  # override for EU region tokens
     LANGSMITH_TRACING: str = "true"
     LANGSMITH_API_KEY: str | None = None
     LANGSMITH_PROJECT: str = "rag_scale_test"
@@ -63,37 +67,36 @@ class Settings(BaseSettings):
 
     @field_validator("QDRANT_API_KEY", mode="before")
     @classmethod
-    def _empty_qdrant_key_as_none(cls, v):
-        """Treat empty QDRANT_API_KEY as unset so local Qdrant doesn't receive a blank header."""
-        if v == "" or v is None:
-            return None
-        return v
+    def _blank_qdrant_key_to_none(cls, v):
+        """Convert an empty QDRANT_API_KEY to None so Qdrant doesn't receive a blank auth header."""
+        return None if v == "" or v is None else v
 
     @property
     def judge_api_key(self) -> str:
-        """Dedicated judge key, falling back to the main OpenAI key."""
+        """Return the dedicated eval judge key, or fall back to the primary OpenAI key."""
         return self.JUDGE_OPENAI_API_KEY or self.OPENAI_API_KEY
 
     @property
     def postgres_uri(self) -> str:
-        """LangGraph Postgres checkpointer URI (Neon).
+        """
+        Construct the Postgres connection string with TCP keepalive parameters.
 
-        Serverless Postgres closes idle connections, so append TCP keepalive
-        options to keep the connection pool healthy between requests.
+        Neon closes idle connections aggressively, so these keepalive options
+        prevent the pool from silently dropping connections between requests.
         """
         base = self.NEON_DB_URL.rstrip("/")
         keepalive = "keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
-        if "?" in base:
-            return f"{base}&{keepalive}"
-        return f"{base}?{keepalive}"
+        separator = "&" if "?" in base else "?"
+        return f"{base}{separator}{keepalive}"
 
     @property
     def redis_url(self) -> str:
-        """TLS Redis URL derived from Upstash REST credentials.
+        """
+        Build a TLS Redis URL from the Upstash REST credentials.
 
-        Upstash exposes the same host for REST and TLS Redis. The REST token is
-        used as the Redis password under the default username. The result is
-        passed to `limits` for rate limiting and to the health checker.
+        Upstash exposes the same hostname for both its REST API and raw Redis
+        protocol. The REST token doubles as the Redis password on the default
+        username, giving us a standards-compliant rediss:// URL.
         """
         host = self.UPSTASH_REDIS_REST_URL.replace("https://", "").rstrip("/")
         token = quote(self.UPSTASH_REDIS_REST_TOKEN, safe="")
@@ -101,16 +104,16 @@ class Settings(BaseSettings):
         return urlunsplit(("rediss", netloc, "/0", "ssl_cert_reqs=required", ""))
 
 
-# Singleton used across the app.
+# Single global instance shared across all modules.
 settings = Settings()
 
 
 def apply_langchain_env():
-    """Write LangSmith/LangChain settings to os.environ for automatic tracing.
+    """
+    Push LangSmith settings into os.environ so LangChain picks them up automatically.
 
-    Tracing is only activated when both LANGSMITH_TRACING and LANGSMITH_API_KEY
-    are set — enabling tracing without a key causes LangChain to emit 401 noise
-    on every LangGraph step.
+    Tracing is only activated when both the tracing flag and an API key are present.
+    Enabling the flag without a key causes LangChain to emit 401 errors on every step.
     """
     if settings.LANGSMITH_TRACING and settings.LANGSMITH_API_KEY:
         os.environ.setdefault("LANGCHAIN_TRACING_V2", settings.LANGSMITH_TRACING)

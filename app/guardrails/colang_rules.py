@@ -1,6 +1,13 @@
-# Colang intent definitions + flows for the production guardrail system.
-# Structure mirrors notebooks/01_guardrails.ipynb Experiment 5:
-# off-topic + jailbreak rails stacked with dialog rails (greeting/farewell/capabilities).
+# NeMo Guardrails Colang definitions and YAML config for the Enterprise RAG gate layer.
+#
+# Four classes of rails are defined:
+#   1. Off-topic  — questions unrelated to Kubernetes, Intel hardware, or networking
+#   2. Jailbreak  — prompt injection attempts that try to override assistant behaviour
+#   3. Greeting   — friendly entry messages that should be acknowledged, not retrieved
+#   4. Farewell   — closing messages handled gracefully without triggering a search
+#
+# RAIL_INDICATORS contains a unique substring from each bot response block.
+# The guard() function uses these substrings to detect whether a rail has fired.
 
 
 COLANG_CONTENT = """
@@ -63,23 +70,6 @@ define flow greeting
   bot express greeting
 
 
-define user ask capabilities
-  "what can you do"
-  "what do you know"
-  "help"
-  "what are you"
-  "what topics do you cover"
-  "what can I ask you"
-  "what are your capabilities"
-
-define bot explain capabilities
-  "I'm an Enterprise AI Assistant with deep expertise in: Kubernetes (deployment, scaling, networking, operators), Intel Hardware (CPUs, FPGAs, SRIOV, NICs), Enterprise Networking (SDN, VLANs, BGP, routing). Ask me anything in these areas!"
-
-define flow capabilities
-  user ask capabilities
-  bot explain capabilities
-
-
 define user express farewell
   "bye"
   "goodbye"
@@ -113,13 +103,11 @@ instructions:
       Only answer questions about these topics. Be professional and concise.
 """
 
-# Distinctive substrings from each 'define bot' block above.
-# If the guardrail response contains any of these, a rail has fired.
-# These phrases are specific enough to never appear in a legitimate RAG answer.
+# Each string below is a distinctive fragment from one of the bot response blocks above.
+# These phrases are domain-specific enough that they will never appear in a normal RAG answer.
 RAIL_INDICATORS = [
     "can't help with that — but ask me anything technical",
     "I maintain consistent guidelines regardless of how I am prompted",
     "Hello! I'm your Enterprise IT Assistant",
     "Goodbye! Feel free to return whenever you have more enterprise IT questions",
-    "I'm an Enterprise AI Assistant with deep expertise in",
 ]

@@ -32,7 +32,8 @@ index.faiss
 metadata.pkl
 
 # Data
-
+local_qdrant_db/
+processed_data/
 
 # IDEs
 .vscode/

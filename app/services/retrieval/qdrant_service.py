@@ -5,8 +5,12 @@ from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponenti
 from app.config import settings
 from app.services.retrieval.embedding import embed_query
 
-# Initialize Qdrant Client
-client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
+# Single shared Qdrant client for the lifetime of the process.
+if settings.QDRANT_URL:
+    client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
+else:
+    # Fallback to local file-based storage so vectors persist between ingestion and API runs
+    client = QdrantClient(path="local_qdrant_db")
 
 
 @retry(
@@ -15,35 +19,40 @@ client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
     reraise=True,
     before_sleep=before_sleep_log(logfire, "warning"),
 )
-def _search_enterprise_knowledge(query: str, limit: int = 8):
-    """Internal search with retry logic."""
-    query_vector = embed_query(query)
+def _search(query: str, limit: int) -> list[dict]:
+    """
+    Embed the query and run a cosine similarity search against the Qdrant collection.
 
-    # Using query_points - the modern standard for Qdrant
+    Returns a list of dicts with 'content', 'source', and 'score' keys.
+    The limit parameter controls how many candidates are returned before reranking.
+    """
+    query_vector = embed_query(query)
     response = client.query_points(
         collection_name=settings.QDRANT_COLLECTION,
         query=query_vector,
         limit=limit,
-        with_payload=True,  # JSON
+        with_payload=True,
     )
+    return [
+        {
+            "content": point.payload.get("text", ""),
+            "source": point.payload.get("source", "Unknown"),
+            "score": point.score,
+        }
+        for point in response.points
+    ]
 
-    results = []
-    for res in response.points:
-        results.append(
-            {"content": res.payload.get("text", ""), "source": res.payload.get("source", "Unknown"), "score": res.score}
-        )
 
-    return results
-
-
-def search_enterprise_knowledge(query: str, limit: int = 8):
+def search_enterprise_knowledge(query: str, limit: int = 8) -> list[dict]:
     """
-    Performs a high-precision search in the enterprise knowledge base.
-    Uses the modern query_points interface. Retries transient failures
-    and gracefully degrades to an empty result set on persistent failure.
+    Public search entry point with graceful degradation.
+
+    Wraps _search with a try/except so that a Qdrant outage returns an empty
+    list rather than crashing the request. The LLM node handles empty context
+    by answering from conversation history where possible.
     """
     try:
-        return _search_enterprise_knowledge(query, limit=limit)
-    except Exception as e:
-        logfire.error(f"❌ Qdrant Search Failed after retries: {e}")
+        return _search(query, limit)
+    except Exception as exc:
+        logfire.error(f"Qdrant search failed after retries: {exc}")
         return []

@@ -10,77 +10,60 @@ _JINA_EMBEDDING_URL = "https://api.jina.ai/v1/embeddings"
 _JINA_MODEL = "jina-embeddings-v3"
 _FALLBACK_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
 
+# These module-level variables track which embedding backend is active.
+# _model_type is set to "jina" or "fallback" on first use.
 _active_model = None
-_model_type: str | None = None  # "jina" or "fallback"
+_model_type: str | None = None
 
 
-# ── Model initialisation ───────────────────────────────────────────────────────
-
-
-def _load_fallback():
-    """Load the local mxbai fallback model."""
+def _load_fallback_model():
+    """Download and load the local mxbai SentenceTransformer model."""
     from sentence_transformers import SentenceTransformer
-
-    logfire.info(f"Loading fallback embedding model ({_FALLBACK_MODEL}, {_EMBEDDING_DIM}-dim).")
+    logfire.info(f"Loading local fallback embedding model: {_FALLBACK_MODEL}")
     return SentenceTransformer(_FALLBACK_MODEL)
 
 
-def _probe_jina_api() -> bool:
-    """Verify the Jina Embeddings API is reachable with the configured key."""
+def _probe_jina() -> bool:
+    """
+    Send a single test embedding to the Jina API to verify the key and endpoint.
+    Returns True if the API responds successfully, False otherwise.
+    """
     if not settings.JINA_API_KEY:
         logfire.info("JINA_API_KEY not set — will use local fallback embeddings.")
         return False
-
     try:
-        response = requests.post(
+        resp = requests.post(
             _JINA_EMBEDDING_URL,
-            headers={
-                "Authorization": f"Bearer {settings.JINA_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": _JINA_MODEL,
-                "task": "retrieval.query",
-                "normalized": True,
-                "input": ["probe"],
-            },
+            headers={"Authorization": f"Bearer {settings.JINA_API_KEY}", "Content-Type": "application/json"},
+            json={"model": _JINA_MODEL, "task": "retrieval.query", "normalized": True, "input": ["probe"]},
             timeout=30,
         )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("data"):
-            raise RuntimeError("Jina API returned empty data")
-        logfire.info("Jina Embeddings API ready (jina-embeddings-v3, 1024-dim).")
+        resp.raise_for_status()
+        if not resp.json().get("data"):
+            raise RuntimeError("Jina returned empty data on probe")
+        logfire.info("Jina Embeddings API is reachable — using jina-embeddings-v3 (1024-dim).")
         return True
-    except Exception as e:
-        logfire.warning(f"Jina Embeddings API probe failed: {e}. Will use local fallback embeddings.")
+    except Exception as exc:
+        logfire.warning(f"Jina probe failed: {exc}. Falling back to local model.")
         return False
 
 
 def _init():
-    """Initialise embedding provider once per process. Called lazily on first use."""
+    """Choose and initialize the embedding backend on first use."""
     global _active_model, _model_type
-    if _active_model is not None or _model_type is not None:
+    if _model_type is not None:
         return
-
-    if _probe_jina_api():
-        _active_model = None  # Jina API is stateless; no local model to keep
+    if _probe_jina():
         _model_type = "jina"
     else:
-        _active_model = _load_fallback()
+        _active_model = _load_fallback_model()
         _model_type = "fallback"
 
 
-# ── Public helpers ─────────────────────────────────────────────────────────────
-
-
 def get_embedding_dim() -> int:
-    """Return the vector dimension for the active model."""
+    """Return the vector dimension for the active embedding model (always 1024)."""
     _init()
     return _EMBEDDING_DIM
-
-
-# ── Jina API embedding ─────────────────────────────────────────────────────────
 
 
 @retry(
@@ -90,94 +73,64 @@ def get_embedding_dim() -> int:
     before_sleep=before_sleep_log(logfire, "warning"),
 )
 def _embed_jina_batch(texts: list[str], task: str) -> list[list[float]]:
-    """Call the Jina Embeddings API for a single batch."""
-    response = requests.post(
+    """POST a single batch of texts to the Jina Embeddings API."""
+    resp = requests.post(
         _JINA_EMBEDDING_URL,
-        headers={
-            "Authorization": f"Bearer {settings.JINA_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": _JINA_MODEL,
-            "task": task,
-            "normalized": True,
-            "input": texts,
-        },
+        headers={"Authorization": f"Bearer {settings.JINA_API_KEY}", "Content-Type": "application/json"},
+        json={"model": _JINA_MODEL, "task": task, "normalized": True, "input": texts},
         timeout=60,
     )
-    response.raise_for_status()
-    payload = response.json()
-
-    results = payload.get("data", [])
-    # Sort by index because the API may not preserve order in rare cases
-    results_sorted = sorted(results, key=lambda x: x.get("index", 0))
-    return [item["embedding"] for item in results_sorted]
+    resp.raise_for_status()
+    results = sorted(resp.json().get("data", []), key=lambda x: x.get("index", 0))
+    return [item["embedding"] for item in results]
 
 
-def _embed_jina(texts: list[str], task: str) -> list[list[float]]:
-    """Embed texts via the Jina API in batches with retry."""
-    all_embeddings: list[list[float]] = []
+def _embed_via_jina(texts: list[str], task: str) -> list[list[float]]:
+    """Split texts into batches and embed each batch via the Jina API."""
+    embeddings: list[list[float]] = []
     for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        with logfire.span("Embed batch via Jina API", start=i, size=len(batch)):
-            embeddings = _embed_jina_batch(batch, task)
-            all_embeddings.extend(embeddings)
-    return all_embeddings
+        batch = texts[i: i + BATCH_SIZE]
+        with logfire.span("Jina embed batch", start=i, size=len(batch)):
+            embeddings.extend(_embed_jina_batch(batch, task))
+    return embeddings
 
 
-# ── Fallback embedding ─────────────────────────────────────────────────────────
-
-
-def _embed_fallback_batch(texts: list[str]) -> list[list[float]]:
-    """Embed texts using the local mxbai model."""
-    embeddings = _active_model.encode(texts, show_progress_bar=False)
-    return embeddings.tolist()
-
-
-def _embed_fallback(texts: list[str]) -> list[list[float]]:
-    """Embed texts via the local fallback model in batches."""
-    all_embeddings: list[list[float]] = []
+def _embed_via_fallback(texts: list[str]) -> list[list[float]]:
+    """Split texts into batches and embed each batch using the local SentenceTransformer."""
+    embeddings: list[list[float]] = []
     for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        with logfire.span("Embed batch via fallback model", start=i, size=len(batch)):
-            all_embeddings.extend(_embed_fallback_batch(batch))
-    return all_embeddings
-
-
-# ── Unified embedding with runtime fallback ────────────────────────────────────
-
-
-def _ensure_fallback():
-    """Switch to the local fallback model if not already active."""
-    global _active_model, _model_type
-    if _model_type != "fallback":
-        logfire.warning("Switching to local fallback embeddings.")
-        _active_model = _load_fallback()
-        _model_type = "fallback"
+        batch = texts[i: i + BATCH_SIZE]
+        with logfire.span("Fallback embed batch", start=i, size=len(batch)):
+            embeddings.extend(_active_model.encode(batch, show_progress_bar=False).tolist())
+    return embeddings
 
 
 def _embed(texts: list[str], task: str) -> list[list[float]]:
-    """Embed texts using the active provider, falling back to local on failure."""
-    _init()
+    """
+    Route embedding requests to Jina API or the local fallback model.
 
+    If the Jina API raises an exception at runtime (after initialization),
+    the module switches permanently to the local fallback model for the
+    remainder of the process lifetime.
+    """
+    global _active_model, _model_type
+
+    _init()
     if _model_type == "jina":
         try:
-            return _embed_jina(texts, task)
-        except Exception as e:
-            logfire.error(f"Jina Embeddings API failed: {e}. Falling back to local model.")
-            _ensure_fallback()
-
-    return _embed_fallback(texts)
-
-
-# ── Public API (same signatures as before) ─────────────────────────────────────
+            return _embed_via_jina(texts, task)
+        except Exception as exc:
+            logfire.error(f"Jina API failed at runtime ({exc}). Switching to local fallback.")
+            _active_model = _load_fallback_model()
+            _model_type = "fallback"
+    return _embed_via_fallback(texts)
 
 
 def embed_query(query: str) -> list[float]:
-    """Embed a single query."""
+    """Embed a single query string for retrieval."""
     return _embed([query], task="retrieval.query")[0]
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a list of document texts."""
+    """Embed a list of document passages for indexing."""
     return _embed(texts, task="retrieval.passage")

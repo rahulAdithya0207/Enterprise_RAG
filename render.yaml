@@ -1,0 +1,52 @@
+services:
+  - type: web
+    name: enterprise-rag-api
+    runtime: python
+    plan: free
+    region: singapore
+    branch: deployment
+    buildCommand: pip install -r requirements-prod.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PORTKEY_API_KEY
+        sync: false
+      - key: PORTKEY_PRIMARY_CONFIG_ID
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: JINA_API_KEY
+        sync: false
+      - key: NEON_DB_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: LOGFIRE_TOKEN
+        sync: false
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: RAG_API_KEY
+        sync: false
+
+  - type: web
+    name: enterprise-rag-ui
+    runtime: python
+    plan: free
+    region: singapore
+    branch: deployment
+    buildCommand: pip install -r requirements-prod.txt
+    startCommand: streamlit run ui/app.py --server.address 0.0.0.0 --server.port $PORT
+    envVars:
+      - key: BACKEND_URL
+        fromService:
+          type: web
+          name: enterprise-rag-api
+          property: hostport
+      - key: RAG_API_KEY
+        sync: false
+      - key: LOGFIRE_TOKEN
+        sync: false

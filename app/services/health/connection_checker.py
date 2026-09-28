@@ -37,6 +37,9 @@ class ConnectionResult:
 
 def _check_neon_postgres() -> ConnectionResult:
     """Verify Neon Postgres is reachable and accepts queries."""
+    if not settings.NEON_DB_URL:
+        return ConnectionResult("postgres", False, "NEON_DB_URL not configured")
+
     pool = None
     conn = None
     try:
@@ -87,11 +90,15 @@ def _check_upstash_redis() -> ConnectionResult:
 def _check_qdrant() -> ConnectionResult:
     """Verify Qdrant cluster is reachable."""
     try:
-        client = QdrantClient(
-            url=settings.QDRANT_URL,
-            api_key=settings.QDRANT_API_KEY,
-            timeout=5,
-        )
+        if settings.QDRANT_URL:
+            client = QdrantClient(
+                url=settings.QDRANT_URL,
+                api_key=settings.QDRANT_API_KEY,
+                timeout=5,
+            )
+        else:
+            from app.services.retrieval.qdrant_service import client
+
         client.get_collections()
         return ConnectionResult("qdrant", True, "Qdrant reachable")
     except Exception as e:
@@ -103,7 +110,7 @@ def _check_portkey_gateway() -> ConnectionResult:
     """Verify Portkey LLM gateway responds to a minimal completion."""
     try:
         resp = portkey_client.chat.completions.create(
-            model=f"@{settings.PORTKEY_PRIMARY_SLUG}/gpt-5-mini",
+            model=f"@{settings.PORTKEY_PRIMARY_SLUG}/{settings.PORTKEY_MODEL}",
             messages=[{"role": "user", "content": "Say hello in one word."}],
             max_completion_tokens=100,
             timeout=10,

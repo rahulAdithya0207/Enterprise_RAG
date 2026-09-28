@@ -92,7 +92,9 @@ if prompt := st.chat_input("Ask about your documentation..."):
                 try:
                     # DISTRIBUTED TRACE: Calling Backend
                     with logfire.span("📡 Calling RAG Backend"):
-                        base_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+                        base_url = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+                        if "://" not in base_url:
+                            base_url = f"http://{base_url}"
                         url = f"{base_url}/query"
                         payload = {"q": prompt, "thread_id": st.session_state.session_id}
                         headers = {
@@ -102,6 +104,12 @@ if prompt := st.chat_input("Ask about your documentation..."):
                         # First guardrails invocation can be slow as NeMo downloads
                         # configs/models; allow up to 3 minutes.
                         response = requests.post(url, json=payload, headers=headers, timeout=180)
+                        if response.status_code != 200:
+                            try:
+                                error_detail = response.json().get("detail", response.text)
+                            except ValueError:
+                                error_detail = response.text
+                            raise RuntimeError(f"Backend returned HTTP {response.status_code}: {error_detail}")
                         data = response.json()
 
                     # Guardrails can block synchronously.
