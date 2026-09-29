@@ -186,20 +186,20 @@ Shows how user intents are classified against the Colang flows to block maliciou
 
 ```mermaid
 flowchart TD
-    A[guard(message) called] --> B{_rails\ninitialized?}
-    B -- No --> C["Log warning\nreturn False, None\npipeline proceeds"]
-    B -- Yes --> D["_rails.generate\nmessages: role=user, content=message\nNeMo runs intent matching against Colang flows"]
-    D --> E{Response content\ncontains any RAIL_INDICATOR substring?}
-    E -- Yes --> F["Rail fired!\nlog rail event\nreturn True, rail_response"]
-    E -- No --> G["Guardrails passed\nreturn False, None"]
-    F --> H["/query returns blocked response\nno LangGraph invoked\nGUARDRAILS_BLOCKS_TOTAL blocked=true"]
-    G --> I["LangGraph pipeline starts\nGUARDRAILS_BLOCKS_TOTAL blocked=false"]
+    A["guard(message) called"] --> B{"_rails initialized?"}
+    B -- No --> C["Log warning<br/>return False, None<br/>pipeline proceeds"]
+    B -- Yes --> D["_rails.generate<br/>messages: role=user, content=message<br/>NeMo runs intent matching against Colang flows"]
+    D --> E{"Response content<br/>contains any RAIL_INDICATOR substring?"}
+    E -- Yes --> F["Rail fired!<br/>log rail event<br/>return True, rail_response"]
+    E -- No --> G["Guardrails passed<br/>return False, None"]
+    F --> H["/query returns blocked response<br/>no LangGraph invoked<br/>GUARDRAILS_BLOCKS_TOTAL blocked=true"]
+    G --> I["LangGraph pipeline starts<br/>GUARDRAILS_BLOCKS_TOTAL blocked=false"]
 
     subgraph INDICATORS ["RAIL_INDICATORS checked"]
-        I1["can't help with that — but ask me anything technical"]
+        I1["can't help with that but ask me anything technical"]
         I2["I maintain consistent guidelines regardless of how I am prompted"]
         I3["Hello! I'm your Enterprise IT Assistant"]
-        I4["Goodbye! Feel free to return whenever..."]
+        I4["Goodbye! Feel free to return whenever"]
     end
     E -.checks.-> INDICATORS
 ```
